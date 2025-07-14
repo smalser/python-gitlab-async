@@ -1,1088 +1,137 @@
-"""Async wrapper for the GitLab API."""
+"""Async GitLab client."""
 
-from __future__ import annotations
+import asyncio
+from typing import Any, Dict, Optional, Union
 
-import os
-import re
-from typing import Any, BinaryIO, cast, TYPE_CHECKING
-from urllib import parse
-
-import httpx
-
-import gitlab
-import gitlab.config
-import gitlab.const
-import gitlab.exceptions
-from gitlab import _backends, utils
-
-try:
-    import gql
-    import gql.transport.exceptions
-    import graphql
-
-    from ._backends.graphql import GitlabAsyncTransport
-
-    _GQL_INSTALLED = True
-except ImportError:  # pragma: no cover
-    _GQL_INSTALLED = False
+from ._backends.httpx_backend import HTTPXBackend
+from .base import Gitlab
+from .exceptions import GitlabAuthenticationError, GitlabHttpError
 
 
-REDIRECT_MSG = (
-    "python-gitlab detected a {status_code} ({reason!r}) redirection. You must update "
-    "your GitLab URL to the correct URL to avoid issues. The redirection was from: "
-    "{source!r} to {target!r}"
-)
-
-
-# https://docs.gitlab.com/ee/api/#offset-based-pagination
-_PAGINATION_URL = (
-    f"https://python-gitlab.readthedocs.io/en/v{gitlab.__version__}/"
-    f"api-usage.html#pagination"
-)
-
-
-class AsyncGitlab:
-    """Represents an async GitLab server connection.
-
-    Args:
-        url: The URL of the GitLab server (defaults to https://gitlab.com).
-        private_token: The user private token
-        oauth_token: An oauth token
-        job_token: A CI job token
-        ssl_verify: Whether SSL certificates should be validated. If
-            the value is a string, it is the path to a CA file used for
-            certificate validation.
-        timeout: Timeout to use for requests to the GitLab server.
-        http_username: Username for HTTP authentication
-        http_password: Password for HTTP authentication
-        api_version: Gitlab API version to use (support for 4 only)
-        pagination: Can be set to 'keyset' to use keyset pagination
-        order_by: Set order_by globally
-        user_agent: A custom user agent to use for making HTTP requests.
-        retry_transient_errors: Whether to retry after 500, 502, 503, 504
-            or 52x responses. Defaults to False.
-        keep_base_url: keep user-provided base URL for pagination if it
-            differs from response headers
-
-    Keyword Args:
-        httpx.AsyncClient client: HTTP AsyncClient
-        HttpxBackend backend: Backend that will be used to make http requests
-    """
+class AsyncGitlab(Gitlab):
+    """Async GitLab client using HTTPX backend."""
 
     def __init__(
         self,
-        url: str | None = None,
-        private_token: str | None = None,
-        oauth_token: str | None = None,
-        job_token: str | None = None,
-        ssl_verify: bool | str = True,
-        http_username: str | None = None,
-        http_password: str | None = None,
-        timeout: float | None = None,
+        url: str,
+        private_token: Optional[str] = None,
+        oauth_token: Optional[str] = None,
+        job_token: Optional[str] = None,
         api_version: str = "4",
-        per_page: int | None = None,
-        pagination: str | None = None,
-        order_by: str | None = None,
-        user_agent: str = gitlab.const.USER_AGENT,
-        retry_transient_errors: bool = False,
-        keep_base_url: bool = False,
+        session: Optional[Any] = None,
         **kwargs: Any,
     ) -> None:
-        self._api_version = str(api_version)
-        self._server_version: str | None = None
-        self._server_revision: str | None = None
-        self._base_url = utils.get_base_url(url)
-        self._url = f"{self._base_url}/api/v{api_version}"
-        #: Timeout to use for requests to gitlab server
-        self.timeout = timeout
-        self.retry_transient_errors = retry_transient_errors
-        self.keep_base_url = keep_base_url
-        #: Headers that will be used in request to GitLab
-        self.headers = {"User-Agent": user_agent}
-
-        #: Whether SSL certificates should be validated
-        self.ssl_verify = ssl_verify
-
-        self.private_token = private_token
-        self.http_username = http_username
-        self.http_password = http_password
-        self.oauth_token = oauth_token
-        self.job_token = job_token
-        self._set_auth_info()
-
-        #: Create a session object for requests
-        _backend: type[_backends.HttpxBackend] = kwargs.pop(
-            "backend", _backends.HttpxBackend
-        )
-        self._backend = _backend(**kwargs)
-        self.session = self._backend.client
-
-        self.per_page = per_page
-        self.pagination = pagination
-        self.order_by = order_by
-
-        # We only support v4 API at this time
-        if self._api_version not in ("4",):
-            raise ModuleNotFoundError(f"gitlab.v{self._api_version}.objects")
-        # NOTE: We must delay import of gitlab.v4.objects until now or
-        # otherwise it will cause circular import errors
-        from gitlab.v4 import objects
-
-        self._objects = objects
-        self.user: objects.CurrentUser | None = None
-
-        self.broadcastmessages = objects.BroadcastMessageManager(self)
-        """See :class:`~gitlab.v4.objects.BroadcastMessageManager`"""
-        self.bulk_imports = objects.BulkImportManager(self)
-        """See :class:`~gitlab.v4.objects.BulkImportManager`"""
-        self.bulk_import_entities = objects.BulkImportAllEntityManager(self)
-        """See :class:`~gitlab.v4.objects.BulkImportAllEntityManager`"""
-        self.ci_lint = objects.CiLintManager(self)
-        """See :class:`~gitlab.v4.objects.CiLintManager`"""
-        self.deploykeys = objects.DeployKeyManager(self)
-        """See :class:`~gitlab.v4.objects.DeployKeyManager`"""
-        self.deploytokens = objects.DeployTokenManager(self)
-        """See :class:`~gitlab.v4.objects.DeployTokenManager`"""
-        self.geonodes = objects.GeoNodeManager(self)
-        """See :class:`~gitlab.v4.objects.GeoNodeManager`"""
-        self.gitlabciymls = objects.GitlabciymlManager(self)
-        """See :class:`~gitlab.v4.objects.GitlabciymlManager`"""
-        self.gitignores = objects.GitignoreManager(self)
-        """See :class:`~gitlab.v4.objects.GitignoreManager`"""
-        self.groups = objects.GroupManager(self)
-        """See :class:`~gitlab.v4.objects.GroupManager`"""
-        self.hooks = objects.HookManager(self)
-        """See :class:`~gitlab.v4.objects.HookManager`"""
-        self.issues = objects.IssueManager(self)
-        """See :class:`~gitlab.v4.objects.IssueManager`"""
-        self.issues_statistics = objects.IssuesStatisticsManager(self)
-        """See :class:`~gitlab.v4.objects.IssuesStatisticsManager`"""
-        self.keys = objects.KeyManager(self)
-        """See :class:`~gitlab.v4.objects.KeyManager`"""
-        self.ldapgroups = objects.LDAPGroupManager(self)
-        """See :class:`~gitlab.v4.objects.LDAPGroupManager`"""
-        self.licenses = objects.LicenseManager(self)
-        """See :class:`~gitlab.v4.objects.LicenseManager`"""
-        self.namespaces = objects.NamespaceManager(self)
-        """See :class:`~gitlab.v4.objects.NamespaceManager`"""
-        self.member_roles = objects.MemberRoleManager(self)
-        """See :class:`~gitlab.v4.objects.MergeRequestManager`"""
-        self.mergerequests = objects.MergeRequestManager(self)
-        """See :class:`~gitlab.v4.objects.MergeRequestManager`"""
-        self.notificationsettings = objects.NotificationSettingsManager(self)
-        """See :class:`~gitlab.v4.objects.NotificationSettingsManager`"""
-        self.projects = objects.ProjectManager(self)
-        """See :class:`~gitlab.v4.objects.ProjectManager`"""
-        self.registry_repositories = objects.RegistryRepositoryManager(self)
-        """See :class:`~gitlab.v4.objects.RegistryRepositoryManager`"""
-        self.runners = objects.RunnerManager(self)
-        """See :class:`~gitlab.v4.objects.RunnerManager`"""
-        self.runners_all = objects.RunnerAllManager(self)
-        """See :class:`~gitlab.v4.objects.RunnerManager`"""
-        self.settings = objects.ApplicationSettingsManager(self)
-        """See :class:`~gitlab.v4.objects.ApplicationSettingsManager`"""
-        self.appearance = objects.ApplicationAppearanceManager(self)
-        """See :class:`~gitlab.v4.objects.ApplicationAppearanceManager`"""
-        self.sidekiq = objects.SidekiqManager(self)
-        """See :class:`~gitlab.v4.objects.SidekiqManager`"""
-        self.snippets = objects.SnippetManager(self)
-        """See :class:`~gitlab.v4.objects.SnippetManager`"""
-        self.users = objects.UserManager(self)
-        """See :class:`~gitlab.v4.objects.UserManager`"""
-        self.todos = objects.TodoManager(self)
-        """See :class:`~gitlab.v4.objects.TodoManager`"""
-        self.dockerfiles = objects.DockerfileManager(self)
-        """See :class:`~gitlab.v4.objects.DockerfileManager`"""
-        self.events = objects.EventManager(self)
-        """See :class:`~gitlab.v4.objects.EventManager`"""
-        self.audit_events = objects.AuditEventManager(self)
-        """See :class:`~gitlab.v4.objects.AuditEventManager`"""
-        self.features = objects.FeatureManager(self)
-        """See :class:`~gitlab.v4.objects.FeatureManager`"""
-        self.pagesdomains = objects.PagesDomainManager(self)
-        """See :class:`~gitlab.v4.objects.PagesDomainManager`"""
-        self.user_activities = objects.UserActivitiesManager(self)
-        """See :class:`~gitlab.v4.objects.UserActivitiesManager`"""
-        self.applications = objects.ApplicationManager(self)
-        """See :class:`~gitlab.v4.objects.ApplicationManager`"""
-        self.variables = objects.VariableManager(self)
-        """See :class:`~gitlab.v4.objects.VariableManager`"""
-        self.personal_access_tokens = objects.PersonalAccessTokenManager(self)
-        """See :class:`~gitlab.v4.objects.PersonalAccessTokenManager`"""
-        self.topics = objects.TopicManager(self)
-        """See :class:`~gitlab.v4.objects.TopicManager`"""
-        self.statistics = objects.ApplicationStatisticsManager(self)
-        """See :class:`~gitlab.v4.objects.ApplicationStatisticsManager`"""
-
-    async def __aenter__(self) -> AsyncGitlab:
-        return self
-
-    async def __aexit__(self, *args: Any) -> None:
-        await self.session.aclose()
-
-    def __getstate__(self) -> dict[str, Any]:
-        state = self.__dict__.copy()
-        state.pop("_objects")
-        return state
-
-    def __setstate__(self, state: dict[str, Any]) -> None:
-        self.__dict__.update(state)
-        # We only support v4 API at this time
-        if self._api_version not in ("4",):
-            raise ModuleNotFoundError(
-                f"gitlab.v{self._api_version}.objects"
-            )  # pragma: no cover, dead code currently
-        # NOTE: We must delay import of gitlab.v4.objects until now or
-        # otherwise it will cause circular import errors
-        from gitlab.v4 import objects
-
-        self._objects = objects
-
-    @property
-    def url(self) -> str:
-        """The user-provided server URL."""
-        return self._base_url
-
-    @property
-    def api_url(self) -> str:
-        """The computed API base URL."""
-        return self._url
-
-    @property
-    def api_version(self) -> str:
-        """The API version used (4 only)."""
-        return self._api_version
-
-    @classmethod
-    def from_config(
-        cls,
-        gitlab_id: str | None = None,
-        config_files: list[str] | None = None,
-        **kwargs: Any,
-    ) -> AsyncGitlab:
-        """Create a Gitlab connection from configuration files.
-
+        """Initialize the async GitLab client.
+        
         Args:
-            gitlab_id: ID of the configuration section.
-            config_files list[str]: List of paths to configuration files.
-
-        kwargs:
-            client httpx.AsyncClient: Custom httpx AsyncClient
-
-        Returns:
-            A Gitlab connection.
-
-        Raises:
-            gitlab.config.GitlabDataError: If the configuration is not correct.
+            url: GitLab instance URL
+            private_token: Private token for authentication
+            oauth_token: OAuth token for authentication
+            job_token: Job token for authentication
+            api_version: API version to use
+            session: Not used in async client (kept for compatibility)
+            **kwargs: Additional arguments passed to HTTPX AsyncClient
         """
-        config = gitlab.config.GitlabConfigParser(
-            gitlab_id=gitlab_id, config_files=config_files
-        )
-        return cls(
-            config.url,
-            private_token=config.private_token,
-            oauth_token=config.oauth_token,
-            job_token=config.job_token,
-            ssl_verify=config.ssl_verify,
-            timeout=config.timeout,
-            http_username=config.http_username,
-            http_password=config.http_password,
-            api_version=config.api_version,
-            per_page=config.per_page,
-            pagination=config.pagination,
-            order_by=config.order_by,
-            user_agent=config.user_agent,
-            retry_transient_errors=config.retry_transient_errors,
-            keep_base_url=config.keep_base_url,
-            **kwargs,
-        )
-
-    @classmethod
-    def merge_config(
-        cls,
-        options: dict[str, Any],
-        gitlab_id: str | None = None,
-        config_files: list[str] | None = None,
-    ) -> AsyncGitlab:
-        """Create a Gitlab connection by merging configuration with
-        the following precedence:
-
-        1. Explicitly provided CLI arguments,
-        2. Environment variables,
-        3. Configuration files:
-            a. explicitly defined config files:
-                i. via the `--config-file` CLI argument,
-                ii. via the `PYTHON_GITLAB_CFG` environment variable,
-            b. user-specific config file,
-            c. system-level config file,
-        4. Environment variables always present in CI (CI_SERVER_URL, CI_JOB_TOKEN).
-
-        Args:
-            options: A dictionary of explicitly provided key-value options.
-            gitlab_id: ID of the configuration section.
-            config_files: List of paths to configuration files.
-        Returns:
-            (gitlab.AsyncGitlab): A Gitlab connection.
-
-        Raises:
-            gitlab.config.GitlabDataError: If the configuration is not correct.
-        """
-        config = gitlab.config.GitlabConfigParser(
-            gitlab_id=gitlab_id, config_files=config_files
-        )
-        url = (
-            options.get("server_url")
-            or config.url
-            or os.getenv("CI_SERVER_URL")
-            or gitlab.const.DEFAULT_URL
-        )
-        private_token, oauth_token, job_token = cls._merge_auth(options, config)
-
-        return cls(
+        # Инициализируем HTTPX backend
+        self._backend = HTTPXBackend(**kwargs)
+        
+        # Вызываем родительский конструктор
+        super().__init__(
             url=url,
             private_token=private_token,
             oauth_token=oauth_token,
             job_token=job_token,
-            ssl_verify=options.get("ssl_verify") or config.ssl_verify,
-            timeout=options.get("timeout") or config.timeout,
-            api_version=options.get("api_version") or config.api_version,
-            per_page=options.get("per_page") or config.per_page,
-            pagination=options.get("pagination") or config.pagination,
-            order_by=options.get("order_by") or config.order_by,
-            user_agent=options.get("user_agent") or config.user_agent,
+            api_version=api_version,
+            session=session,
         )
-
-    @staticmethod
-    def _merge_auth(
-        options: dict[str, Any], config: gitlab.config.GitlabConfigParser
-    ) -> tuple[str | None, str | None, str | None]:
-        """
-        Return a tuple where at most one of 3 token types ever has a value.
-        Since multiple types of tokens may be present in the environment,
-        options, or config files, this precedence ensures we don't
-        inadvertently cause errors when initializing the client.
-
-        This is especially relevant when executed in CI where user and
-        CI-provided values are both available.
-        """
-        private_token = options.get("private_token") or config.private_token
-        oauth_token = options.get("oauth_token") or config.oauth_token
-        job_token = (
-            options.get("job_token") or config.job_token or os.getenv("CI_JOB_TOKEN")
-        )
-
-        if private_token:
-            return (private_token, None, None)
-        if oauth_token:
-            return (None, oauth_token, None)
-        if job_token:
-            return (None, None, job_token)
-
-        return (None, None, None)
-
-    async def auth(self) -> None:
-        """Performs an authentication using private token. Warns the user if a
-        potentially misconfigured URL is detected on the client or server side.
-
-        The `user` attribute will hold a `gitlab.objects.CurrentUser` object on
-        success.
-        """
-        self.user = await self._objects.CurrentUserManager(self).get()
-
-        if hasattr(self.user, "web_url") and hasattr(self.user, "username"):
-            self._check_url(self.user.web_url, path=self.user.username)
-
-    async def version(self) -> tuple[str, str]:
-        """Returns the version and revision of the gitlab server.
-
-        Note that self.version and self.revision will be set on the gitlab
-        object.
-
-        Returns:
-            The server version and server revision.
-                ('unknown', 'unknown') if the server doesn't perform as expected.
-        """
-        if self._server_version is None:
-            try:
-                data = await self.http_get("/version")
-                if isinstance(data, dict):
-                    self._server_version = data["version"]
-                    self._server_revision = data["revision"]
-                else:
-                    self._server_version = "unknown"
-                    self._server_revision = "unknown"
-            except Exception:
-                self._server_version = "unknown"
-                self._server_revision = "unknown"
-
-        return cast(str, self._server_version), cast(str, self._server_revision)
-
-    @gitlab.exceptions.on_http_error(gitlab.exceptions.GitlabMarkdownError)
-    async def markdown(
-        self, text: str, gfm: bool = False, project: str | None = None, **kwargs: Any
-    ) -> str:
-        """Render an arbitrary Markdown document.
-
-        Args:
-            text: The markdown text to render
-            gfm: Render text using GitLab Flavored Markdown. Default is False
-            project: Full path of a project used a context when `gfm` is True
-            **kwargs: Extra options to send to the server (e.g. sudo)
-
-        Raises:
-            GitlabAuthenticationError: If authentication is not correct
-            GitlabMarkdownError: If the server cannot perform the request
-
-        Returns:
-            The HTML rendering of the markdown text.
-        """
-        post_data = {"text": text, "gfm": gfm}
-        if project is not None:
-            post_data["project"] = project
-        data = await self.http_post("/markdown", post_data=post_data, **kwargs)
-        if TYPE_CHECKING:
-            assert not isinstance(data, httpx.Response)
-            assert isinstance(data["html"], str)
-        return data["html"]
-
-    @gitlab.exceptions.on_http_error(gitlab.exceptions.GitlabLicenseError)
-    async def get_license(self, **kwargs: Any) -> dict[str, str | dict[str, str]]:
-        """Retrieve information about the current license.
-
-        Args:
-            **kwargs: Extra options to send to the server (e.g. sudo)
-
-        Raises:
-            GitlabAuthenticationError: If authentication is not correct
-            GitlabGetError: If the server cannot perform the request
-
-        Returns:
-            The current license information
-        """
-        result = await self.http_get("/license", **kwargs)
-        if isinstance(result, dict):
-            return result
-        return {}
-
-    @gitlab.exceptions.on_http_error(gitlab.exceptions.GitlabLicenseError)
-    async def set_license(self, license: str, **kwargs: Any) -> dict[str, Any]:
-        """Add a new license.
-
-        Args:
-            license: The license string
-            **kwargs: Extra options to send to the server (e.g. sudo)
-
-        Raises:
-            GitlabAuthenticationError: If authentication is not correct
-            GitlabPostError: If the server cannot perform the request
-
-        Returns:
-            The new license information
-        """
-        data = {"license": license}
-        result = await self.http_post("/license", post_data=data, **kwargs)
-        if TYPE_CHECKING:
-            assert not isinstance(result, httpx.Response)
-        return result
-
-    def _set_auth_info(self) -> None:
-        tokens = [
-            token
-            for token in [self.private_token, self.oauth_token, self.job_token]
-            if token
-        ]
-        if len(tokens) > 1:
-            raise ValueError(
-                "Only one of private_token, oauth_token or job_token should "
-                "be defined"
-            )
-        if (self.http_username and not self.http_password) or (
-            not self.http_username and self.http_password
-        ):
-            raise ValueError("Both http_username and http_password should be defined")
-        if tokens and self.http_username:
-            raise ValueError(
-                "Only one of token authentications or http "
-                "authentication should be defined"
-            )
-
-        self._auth: httpx.Auth | None = None
-        if self.private_token:
-            self._auth = _backends.PrivateTokenAuth(self.private_token)
-
-        if self.oauth_token:
-            self._auth = _backends.OAuthTokenAuth(self.oauth_token)
-
-        if self.job_token:
-            self._auth = _backends.JobTokenAuth(self.job_token)
-
-        if self.http_username and self.http_password:
-            self._auth = httpx.BasicAuth(self.http_username, self.http_password)
-
-    def enable_debug(self, mask_credentials: bool = True) -> None:
-        import logging
-        from http import client
-
-        client.HTTPConnection.debuglevel = 1
-        logging.basicConfig()
-        logger = logging.getLogger()
-        logger.setLevel(logging.DEBUG)
-
-        httpclient_log = logging.getLogger("http.client")
-        httpclient_log.propagate = True
-        httpclient_log.setLevel(logging.DEBUG)
-
-        httpx_log = logging.getLogger("httpx")
-        httpx_log.setLevel(logging.DEBUG)
-        httpx_log.propagate = True
-
-        # shadow http.client prints to log()
-        # https://stackoverflow.com/a/16337639
-        def print_as_log(*args: Any) -> None:
-            httpclient_log.log(logging.DEBUG, " ".join(args))
-
-        setattr(client, "print", print_as_log)
-
-        if not mask_credentials:
-            return
-
-        token = self.private_token or self.oauth_token or self.job_token
-        handler = logging.StreamHandler()
-        handler.setFormatter(utils.MaskingFormatter(masked=token))
-        logger.handlers.clear()
-        logger.addHandler(handler)
-
-    def _get_session_opts(self) -> dict[str, Any]:
-        return {
-            "headers": self.headers.copy(),
-            "auth": self._auth,
-            "timeout": self.timeout,
-            "verify": self.ssl_verify,
-        }
-
-    def _build_url(self, path: str) -> str:
-        """Returns the full url from path.
-
-        If path is already a url, return it unchanged. If it's a path, append
-        it to the stored url.
-
-        Returns:
-            The full URL
-        """
-        if path.startswith("http://") or path.startswith("https://"):
-            return path
-        return f"{self._url}{path}"
-
-    def _check_url(self, url: str | None, *, path: str = "api") -> str | None:
-        """
-        Checks if ``url`` starts with a different base URL from the user-provided base
-        URL and warns the user before returning it. If ``keep_base_url`` is set to
-        ``True``, instead returns the URL massaged to match the user-provided base URL.
-        """
-        if not url or url.startswith(self.url):
-            return url
-
-        match = re.match(rf"(^.*?)/{path}", url)
-        if not match:
-            return url
-
-        base_url = match.group(1)
-        if self.keep_base_url:
-            return url.replace(base_url, f"{self._base_url}")
-
-        utils.warn(
-            message=(
-                f"The base URL in the server response differs from the user-provided "
-                f"base URL ({self.url} -> {base_url}).\nThis is usually caused by a "
-                f"misconfigured base URL on your side or a misconfigured external_url "
-                f"on the server side, and can lead to broken pagination and unexpected "
-                f"behavior. If this is intentional, use `keep_base_url=True` when "
-                f"initializing the Gitlab instance to keep the user-provided base URL."
-            ),
-            category=UserWarning,
-        )
-        return url
-
-    @staticmethod
-    def _check_redirects(result: httpx.Response) -> None:
-        # Check the requests history to detect 301/302 redirections.
-        # If the initial verb is POST or PUT, the redirected request will use a
-        # GET request, leading to unwanted behaviour.
-        # If we detect a redirection with a POST or a PUT request, we
-        # raise an exception with a useful error message.
-        if not result.history:
-            return
-
-        for item in result.history:
-            if item.status_code not in (301, 302):
-                continue
-            # GET and HEAD methods can be redirected without issue
-            if item.request.method in ("GET", "HEAD"):
-                continue
-            target = item.headers.get("location")
-            raise gitlab.exceptions.RedirectError(
-                REDIRECT_MSG.format(
-                    status_code=item.status_code,
-                    reason=item.reason_phrase,
-                    source=item.url,
-                    target=target,
-                )
-            )
 
     async def http_request(
         self,
-        verb: str,
-        path: str,
-        query_data: dict[str, Any] | None = None,
-        post_data: dict[str, Any] | bytes | BinaryIO | None = None,
-        raw: bool = False,
-        streamed: bool = False,
-        files: dict[str, Any] | None = None,
-        timeout: float | None = None,
-        obey_rate_limit: bool = True,
-        retry_transient_errors: bool | None = None,
-        max_retries: int = 10,
-        extra_headers: dict[str, Any] | None = None,
+        method: str,
+        url: str,
+        headers: Optional[Dict[str, str]] = None,
+        data: Optional[Union[Dict[str, Any], str]] = None,
+        params: Optional[Dict[str, Any]] = None,
+        timeout: Optional[float] = None,
         **kwargs: Any,
-    ) -> httpx.Response:
-        """Make an HTTP request to the Gitlab server.
-
+    ) -> Dict[str, Any]:
+        """Make an async HTTP request.
+        
         Args:
-            verb: The HTTP method to call ('get', 'post', 'put', 'delete')
-            path: Path or full URL to query ('/projects' or
-                        'http://whatever/v4/api/projecs')
-            query_data: Data to send as query parameters
-            post_data: Data to send in the body (will be converted to
-                              json by default)
-            raw: If True, do not convert post_data to json
-            streamed: Whether the data should be streamed
-            files: The files to send to the server
-            timeout: The timeout, in seconds, for the request
-            obey_rate_limit: Whether to obey 429 Too Many Request
-                                    responses. Defaults to True.
-            retry_transient_errors: Whether to retry after 500, 502, 503, 504
-                or 52x responses. Defaults to False.
-            max_retries: Max retries after 429 or transient errors,
-                               set to -1 to retry forever. Defaults to 10.
-            extra_headers: Add and override HTTP headers for the request.
-            **kwargs: Extra options to send to the server (e.g. sudo)
-
+            method: HTTP method
+            url: Request URL
+            headers: Request headers
+            data: Request data
+            params: Query parameters
+            timeout: Request timeout
+            **kwargs: Additional arguments
+            
         Returns:
-            A httpx result object.
-
+            Response dictionary with status_code, headers, content, and text
+            
         Raises:
-            GitlabHttpError: When the return code is not 2xx
+            GitlabHttpError: If the request fails
+            GitlabAuthenticationError: If authentication fails
         """
-        query_data = query_data or {}
-        raw_url = self._build_url(path)
-
-        # parse user-provided URL params to ensure we don't add our own duplicates
-        parsed = parse.urlparse(raw_url)
-        params = parse.parse_qs(parsed.query)
-        utils.copy_dict(src=query_data, dest=params)
-
-        url = parse.urlunparse(parsed._replace(query=""))
-
-        # Deal with kwargs: by default a user uses kwargs to send data to the
-        # gitlab server, but this generates problems (python keyword conflicts
-        # and python-gitlab/gitlab conflicts).
-        # So we provide a `query_parameters` key: if it's there we use its dict
-        # value as arguments for the gitlab server, and ignore the other
-        # arguments, except pagination ones (per_page and page)
-        if "query_parameters" in kwargs:
-            utils.copy_dict(src=kwargs["query_parameters"], dest=params)
-            for arg in ("per_page", "page"):
-                if arg in kwargs:
-                    params[arg] = kwargs[arg]
-        else:
-            utils.copy_dict(src=kwargs, dest=params)
-
-        opts = self._get_session_opts()
-
-        verify = opts.pop("verify")
-        opts_timeout = opts.pop("timeout")
-        # If timeout was passed into kwargs, allow it to override the default
-        if timeout is None:
-            timeout = opts_timeout
-        if retry_transient_errors is None:
-            retry_transient_errors = self.retry_transient_errors
-
-        # We need to deal with json vs. data when uploading files
-        send_data = self._backend.prepare_send_data(files, post_data, raw)
-        opts["headers"]["Content-type"] = send_data.content_type
-
-        if extra_headers is not None:
-            opts["headers"].update(extra_headers)
-
-        retry = utils.Retry(
-            max_retries=max_retries,
-            obey_rate_limit=obey_rate_limit,
-            retry_transient_errors=retry_transient_errors,
-        )
-
-        while True:
-            try:
-                result = await self._backend.http_request(
-                    method=verb,
-                    url=url,
-                    json=send_data.json,
-                    data=send_data.data,
-                    params=params,
-                    timeout=timeout,
-                    verify=verify,
-                    stream=streamed,
-                    **opts,
-                )
-            except (httpx.ConnectError, httpx.ReadError):
-                if retry.handle_retry():
-                    continue
-                raise
-
-            self._check_redirects(result.response)
-
-            if 200 <= result.status_code < 300:
-                return result.response
-
-            if retry.handle_retry_on_status(
-                result.status_code, result.headers, result.reason
-            ):
-                continue
-
-            error_message = result.content
-            try:
-                error_json = result.json()
-                for k in ("message", "error"):
-                    if k in error_json:
-                        error_message = error_json[k]
-            except (KeyError, ValueError, TypeError):
-                pass
-
-            if result.status_code == 401:
-                raise gitlab.exceptions.GitlabAuthenticationError(
-                    response_code=result.status_code,
-                    error_message=error_message,
-                    response_body=result.content,
-                )
-
-            raise gitlab.exceptions.GitlabHttpError(
-                response_code=result.status_code,
-                error_message=error_message,
-                response_body=result.content,
+        # Добавляем заголовки аутентификации
+        if headers is None:
+            headers = {}
+        
+        if self.private_token:
+            headers["PRIVATE-TOKEN"] = self.private_token
+        elif self.oauth_token:
+            headers["Authorization"] = f"Bearer {self.oauth_token}"
+        elif self.job_token:
+            headers["JOB-TOKEN"] = self.job_token
+        
+        # Добавляем User-Agent
+        headers["User-Agent"] = f"python-gitlab-async/{self.api_version}"
+        
+        try:
+            response = await self._backend.request(
+                method=method,
+                url=url,
+                headers=headers,
+                data=data,
+                params=params,
+                timeout=timeout,
+                **kwargs,
             )
-
-    async def http_get(
-        self,
-        path: str,
-        query_data: dict[str, Any] | None = None,
-        streamed: bool = False,
-        raw: bool = False,
-        **kwargs: Any,
-    ) -> dict[str, Any] | httpx.Response:
-        """Make a GET request to the Gitlab server.
-
-        Args:
-            path: Path or full URL to query ('/projects' or
-                        'http://whatever/v4/api/projecs')
-            query_data: Data to send as query parameters
-            streamed: Whether the data should be streamed
-            raw: If True do not try to parse the output as json
-            **kwargs: Extra options to send to the server (e.g. sudo)
-
-        Returns:
-            A httpx result object is streamed is True or the content type is
-            not json.
-            The parsed json data otherwise.
-
-        Raises:
-            GitlabHttpError: When the return code is not 2xx
-            GitlabParsingError: If the json data could not be parsed
-        """
-        query_data = query_data or {}
-        result = await self.http_request(
-            "get", path, query_data=query_data, streamed=streamed, **kwargs
-        )
-        content_type = utils.get_content_type(result.headers.get("Content-Type"))
-
-        if content_type == "application/json" and not streamed and not raw:
-            try:
-                json_result = result.json()
-                if TYPE_CHECKING:
-                    assert isinstance(json_result, dict)
-                return json_result
-            except Exception as e:
-                raise gitlab.exceptions.GitlabParsingError(
-                    error_message="Failed to parse the server message"
-                ) from e
-        else:
-            return result
-
-    async def http_head(
-        self, path: str, query_data: dict[str, Any] | None = None, **kwargs: Any
-    ) -> httpx.Headers:
-        """Make a HEAD request to the Gitlab server.
-
-        Args:
-            path: Path or full URL to query ('/projects' or
-                        'http://whatever/v4/api/projecs')
-            query_data: Data to send as query parameters
-            **kwargs: Extra options to send to the server (e.g. sudo, page,
-                      per_page)
-        Returns:
-            A httpx.headers object
-        Raises:
-            GitlabHttpError: When the return code is not 2xx
-        """
-
-        query_data = query_data or {}
-        result = await self.http_request("head", path, query_data=query_data, **kwargs)
-        return result.headers
-
-    async def http_list(
-        self,
-        path: str,
-        query_data: dict[str, Any] | None = None,
-        *,
-        iterator: bool | None = None,
-        message_details: utils.WarnMessageData | None = None,
-        **kwargs: Any,
-    ) -> list[dict[str, Any]]:
-        """Make a GET request to the Gitlab server for list-oriented queries.
-
-        Args:
-            path: Path or full URL to query ('/projects' or
-                        'http://whatever/v4/api/projects')
-            query_data: Data to send as query parameters
-            iterator: Indicate if should return a generator (True)
-            **kwargs: Extra options to send to the server (e.g. sudo, page,
-                      per_page)
-
-        Returns:
-            A list of the objects returned by the server.
-
-        Raises:
-            GitlabHttpError: When the return code is not 2xx
-            GitlabParsingError: If the json data could not be parsed
-        """
-        query_data = query_data or {}
-
-        # Provide a `get_all`` param to avoid clashes with `all` API attributes.
-        get_all = kwargs.pop("get_all", None)
-
-        if get_all is None:
-            # For now, keep `all` without deprecation.
-            get_all = kwargs.pop("all", None)
-
-        url = self._build_url(path)
-
-        page = kwargs.get("page")
-
-        if get_all is True:
-            # For async, we'll return all items in a list
-            items = []
-            current_page = 1
-            while True:
-                kwargs["page"] = current_page
-                result = await self.http_get(path, query_data=query_data, **kwargs)
-                if isinstance(result, dict) and isinstance(result.get("data"), list):
-                    items.extend(result["data"])
-                    if len(result["data"]) < kwargs.get("per_page", 20):
-                        break
-                    current_page += 1
+            
+            # Проверяем статус код
+            if response["status_code"] >= 400:
+                if response["status_code"] == 401:
+                    raise GitlabAuthenticationError(
+                        f"Authentication failed: {response['text']}"
+                    )
                 else:
-                    break
-            return items
-
-        # pagination requested, we return a list
-        result = await self.http_get(path, query_data=query_data, **kwargs)
-        if isinstance(result, dict) and isinstance(result.get("data"), list):
-            return result["data"]
-        return []
-
-    async def http_post(
-        self,
-        path: str,
-        query_data: dict[str, Any] | None = None,
-        post_data: dict[str, Any] | None = None,
-        raw: bool = False,
-        files: dict[str, Any] | None = None,
-        **kwargs: Any,
-    ) -> dict[str, Any] | httpx.Response:
-        """Make a POST request to the Gitlab server.
-
-        Args:
-            path: Path or full URL to query ('/projects' or
-                        'http://whatever/v4/api/projecs')
-            query_data: Data to send as query parameters
-            post_data: Data to send in the body (will be converted to
-                              json by default)
-            raw: If True, do not convert post_data to json
-            files: The files to send to the server
-            **kwargs: Extra options to send to the server (e.g. sudo)
-
-        Returns:
-            The parsed json returned by the server if json is return, else the
-            raw content
-
-        Raises:
-            GitlabHttpError: When the return code is not 2xx
-            GitlabParsingError: If the json data could not be parsed
-        """
-        query_data = query_data or {}
-        post_data = post_data or {}
-
-        result = await self.http_request(
-            "post",
-            path,
-            query_data=query_data,
-            post_data=post_data,
-            files=files,
-            raw=raw,
-            **kwargs,
-        )
-        content_type = utils.get_content_type(result.headers.get("Content-Type"))
-
-        try:
-            if content_type == "application/json":
-                json_result = result.json()
-                if TYPE_CHECKING:
-                    assert isinstance(json_result, dict)
-                return json_result
+                    raise GitlabHttpError(
+                        f"HTTP {response['status_code']}: {response['text']}"
+                    )
+            
+            return response
+            
         except Exception as e:
-            raise gitlab.exceptions.GitlabParsingError(
-                error_message="Failed to parse the server message"
-            ) from e
-        return result
+            if isinstance(e, (GitlabHttpError, GitlabAuthenticationError)):
+                raise
+            raise GitlabHttpError(f"Request failed: {str(e)}")
 
-    async def http_put(
-        self,
-        path: str,
-        query_data: dict[str, Any] | None = None,
-        post_data: dict[str, Any] | bytes | BinaryIO | None = None,
-        raw: bool = False,
-        files: dict[str, Any] | None = None,
-        **kwargs: Any,
-    ) -> dict[str, Any] | httpx.Response:
-        """Make a PUT request to the Gitlab server.
+    async def get(self, url: str, **kwargs: Any) -> Dict[str, Any]:
+        """Make a GET request."""
+        return await self.http_request("GET", url, **kwargs)
 
-        Args:
-            path: Path or full URL to query ('/projects' or
-                        'http://whatever/v4/api/projecs')
-            query_data: Data to send as query parameters
-            post_data: Data to send in the body (will be converted to
-                              json by default)
-            raw: If True, do not convert post_data to json
-            files: The files to send to the server
-            **kwargs: Extra options to send to the server (e.g. sudo)
+    async def post(self, url: str, **kwargs: Any) -> Dict[str, Any]:
+        """Make a POST request."""
+        return await self.http_request("POST", url, **kwargs)
 
-        Returns:
-            The parsed json returned by the server.
+    async def put(self, url: str, **kwargs: Any) -> Dict[str, Any]:
+        """Make a PUT request."""
+        return await self.http_request("PUT", url, **kwargs)
 
-        Raises:
-            GitlabHttpError: When the return code is not 2xx
-            GitlabParsingError: If the json data could not be parsed
-        """
-        query_data = query_data or {}
-        post_data = post_data or {}
+    async def delete(self, url: str, **kwargs: Any) -> Dict[str, Any]:
+        """Make a DELETE request."""
+        return await self.http_request("DELETE", url, **kwargs)
 
-        result = await self.http_request(
-            "put",
-            path,
-            query_data=query_data,
-            post_data=post_data,
-            files=files,
-            raw=raw,
-            **kwargs,
-        )
-        if result.status_code in gitlab.const.NO_JSON_RESPONSE_CODES:
-            return result
-        try:
-            json_result = result.json()
-            if TYPE_CHECKING:
-                assert isinstance(json_result, dict)
-            return json_result
-        except Exception as e:
-            raise gitlab.exceptions.GitlabParsingError(
-                error_message="Failed to parse the server message"
-            ) from e
-
-    async def http_patch(
-        self,
-        path: str,
-        *,
-        query_data: dict[str, Any] | None = None,
-        post_data: dict[str, Any] | bytes | None = None,
-        raw: bool = False,
-        **kwargs: Any,
-    ) -> dict[str, Any] | httpx.Response:
-        """Make a PATCH request to the Gitlab server.
-
-        Args:
-            path: Path or full URL to query ('/projects' or
-                        'http://whatever/v4/api/projecs')
-            query_data: Data to send as query parameters
-            post_data: Data to send in the body (will be converted to
-                              json by default)
-            raw: If True, do not convert post_data to json
-            **kwargs: Extra options to send to the server (e.g. sudo)
-
-        Returns:
-            The parsed json returned by the server.
-
-        Raises:
-            GitlabHttpError: When the return code is not 2xx
-            GitlabParsingError: If the json data could not be parsed
-        """
-        query_data = query_data or {}
-        post_data = post_data or {}
-
-        result = await self.http_request(
-            "patch", path, query_data=query_data, post_data=post_data, raw=raw, **kwargs
-        )
-        if result.status_code in gitlab.const.NO_JSON_RESPONSE_CODES:
-            return result
-        try:
-            json_result = result.json()
-            if TYPE_CHECKING:
-                assert isinstance(json_result, dict)
-            return json_result
-        except Exception as e:
-            raise gitlab.exceptions.GitlabParsingError(
-                error_message="Failed to parse the server message"
-            ) from e
-
-    async def http_delete(self, path: str, **kwargs: Any) -> httpx.Response:
-        """Make a DELETE request to the Gitlab server.
-
-        Args:
-            path: Path or full URL to query ('/projects' or
-                        'http://whatever/v4/api/projecs')
-            **kwargs: Extra options to send to the server (e.g. sudo)
-
-        Returns:
-            The httpx object.
-
-        Raises:
-            GitlabHttpError: When the return code is not 2xx
-        """
-        return await self.http_request("delete", path, **kwargs)
-
-    @gitlab.exceptions.on_http_error(gitlab.exceptions.GitlabSearchError)
-    async def search(
-        self, scope: str, search: str, **kwargs: Any
-    ) -> list[dict[str, Any]]:
-        """Search GitLab resources matching the provided string.'
-
-        Args:
-            scope: Scope of the search
-            search: Search string
-            **kwargs: Extra options to send to the server (e.g. sudo)
-
-        Raises:
-            GitlabAuthenticationError: If authentication is not correct
-            GitlabSearchError: If the server failed to perform the request
-
-        Returns:
-            A list of dicts describing the resources found.
-        """
-        data = {"scope": scope, "search": search}
-        return await self.http_list("/search", query_data=data, **kwargs) 
+    async def patch(self, url: str, **kwargs: Any) -> Dict[str, Any]:
+        """Make a PATCH request."""
+        return await self.http_request("PATCH", url, **kwargs) 

@@ -1,6 +1,13 @@
-# Асинхронная поддержка для python-gitlab
+# Асинхронный GitLab клиент
 
-Этот патч добавляет асинхронную поддержку в библиотеку python-gitlab, позволяя использовать `httpx` вместо `requests` для асинхронных HTTP запросов.
+Этот модуль предоставляет асинхронный клиент для работы с GitLab API, используя HTTPX для HTTP запросов.
+
+## Особенности
+
+- **Полностью асинхронный**: Все HTTP запросы выполняются асинхронно
+- **Простота использования**: Каждый запрос создает свой собственный `AsyncClient` и автоматически закрывает его
+- **Совместимость**: Наследует от базового класса `Gitlab` и поддерживает все стандартные методы
+- **Обработка ошибок**: Встроенная обработка ошибок аутентификации и HTTP ошибок
 
 ## Установка
 
@@ -16,181 +23,171 @@ pip install httpx
 
 ```python
 import asyncio
-import gitlab
+from gitlab import AsyncGitlab
 
 async def main():
     # Создаем асинхронный клиент
-    async with gitlab.AsyncGitlab(
+    gl = AsyncGitlab(
         url="https://gitlab.com",
-        private_token="your-token"
-    ) as gl:
-        
-        # Аутентификация
-        await gl.auth()
-        print(f"Аутентифицирован как: {gl.user.name}")
-        
-        # Получаем список проектов
-        projects = await gl.projects.list(per_page=10)
-        for project in projects:
-            print(f"Проект: {project.name}")
+        private_token="your-token-here"
+    )
+    
+    # Выполняем запросы
+    response = await gl.get("/user")
+    print(f"Пользователь: {response['text']}")
+    
+    # Получаем список проектов
+    projects = await gl.get("/projects", params={"per_page": 5})
+    print(f"Проекты: {projects['text']}")
 
-# Запуск
+# Запускаем
 asyncio.run(main())
 ```
 
-### Работа с проектами
+### Доступные методы
+
+Клиент поддерживает все основные HTTP методы:
 
 ```python
-async def work_with_project():
-    async with gitlab.AsyncGitlab(
-        url="https://gitlab.com",
-        private_token="your-token"
-    ) as gl:
-        
-        # Получаем конкретный проект
-        project = await gl.projects.get("group/project")
-        
-        # Получаем issues
-        issues = await project.issues.list(per_page=20)
-        
-        # Получаем merge requests
-        mrs = await project.mergerequests.list(per_page=20)
-        
-        # Получаем коммиты
-        commits = await project.commits.list(per_page=10)
+# GET запрос
+response = await gl.get("/projects")
+
+# POST запрос
+response = await gl.post("/projects", data={"name": "new-project"})
+
+# PUT запрос
+response = await gl.put("/projects/123", data={"description": "Updated"})
+
+# DELETE запрос
+response = await gl.delete("/projects/123")
+
+# PATCH запрос
+response = await gl.patch("/projects/123", data={"name": "new-name"})
 ```
 
-### Поиск
+### Параметры запросов
 
 ```python
-async def search_example():
-    async with gitlab.AsyncGitlab(
-        url="https://gitlab.com",
-        private_token="your-token"
-    ) as gl:
-        
-        # Поиск проектов
-        projects = await gl.search("projects", "python")
-        
-        # Поиск issues
-        issues = await gl.search("issues", "bug")
+# С параметрами запроса
+response = await gl.get("/projects", params={
+    "per_page": 10,
+    "page": 1,
+    "order_by": "created_at"
+})
+
+# С заголовками
+response = await gl.get("/projects", headers={
+    "Custom-Header": "value"
+})
+
+# С таймаутом
+response = await gl.get("/projects", timeout=30.0)
+```
+
+### Обработка ошибок
+
+```python
+try:
+    response = await gl.get("/user")
+    print(f"Успех: {response['text']}")
+except GitlabAuthenticationError as e:
+    print(f"Ошибка аутентификации: {e}")
+except GitlabHttpError as e:
+    print(f"HTTP ошибка: {e}")
+except Exception as e:
+    print(f"Общая ошибка: {e}")
+```
+
+### Аутентификация
+
+Поддерживаются различные типы аутентификации:
+
+```python
+# Private Token
+gl = AsyncGitlab(
+    url="https://gitlab.com",
+    private_token="your-private-token"
+)
+
+# OAuth Token
+gl = AsyncGitlab(
+    url="https://gitlab.com",
+    oauth_token="your-oauth-token"
+)
+
+# Job Token (для CI/CD)
+gl = AsyncGitlab(
+    url="https://gitlab.com",
+    job_token="your-job-token"
+)
 ```
 
 ### Параллельные запросы
 
 ```python
-async def parallel_requests():
-    async with gitlab.AsyncGitlab(
+async def fetch_data():
+    gl = AsyncGitlab(
         url="https://gitlab.com",
         private_token="your-token"
-    ) as gl:
-        
-        # Выполняем несколько запросов параллельно
-        tasks = [
-            gl.projects.list(per_page=5),
-            gl.users.list(per_page=5),
-            gl.groups.list(per_page=5)
-        ]
-        
-        results = await asyncio.gather(*tasks)
-        projects, users, groups = results
-        
-        print(f"Проектов: {len(projects)}")
-        print(f"Пользователей: {len(users)}")
-        print(f"Групп: {len(groups)}")
+    )
+    
+    # Выполняем несколько запросов параллельно
+    tasks = [
+        gl.get("/projects"),
+        gl.get("/users"),
+        gl.get("/groups")
+    ]
+    
+    results = await asyncio.gather(*tasks)
+    return results
+
+# Запускаем
+projects, users, groups = await fetch_data()
 ```
 
-## Основные отличия от синхронной версии
+## Архитектура
 
-1. **Импорт**: Используйте `gitlab.AsyncGitlab` вместо `gitlab.Gitlab`
-2. **Контекстный менеджер**: Используйте `async with` для автоматического закрытия соединения
-3. **Асинхронные методы**: Все методы HTTP запросов теперь асинхронные
-4. **Await**: Добавьте `await` перед всеми вызовами методов клиента
+### HTTPX Backend
 
-## Поддерживаемые методы
+Клиент использует кастомный HTTPX backend (`HTTPXBackend`), который:
 
-Все основные методы синхронной версии поддерживаются в асинхронной версии:
+1. Создает новый `AsyncClient` для каждого запроса
+2. Автоматически закрывает соединение после выполнения запроса
+3. Возвращает стандартизированный ответ в виде словаря
 
-- `http_get()`
-- `http_post()`
-- `http_put()`
-- `http_patch()`
-- `http_delete()`
-- `http_list()`
-- `http_head()`
-- `search()`
-- `auth()`
-- `version()`
-- `markdown()`
-- `get_license()`
-- `set_license()`
+### Структура ответа
 
-## Обработка ошибок
+Каждый HTTP запрос возвращает словарь с полями:
 
 ```python
-async def error_handling():
-    async with gitlab.AsyncGitlab(
-        url="https://gitlab.com",
-        private_token="your-token"
-    ) as gl:
-        
-        try:
-            project = await gl.projects.get("non-existent/project")
-        except gitlab.exceptions.GitlabGetError as e:
-            print(f"Проект не найден: {e}")
-        except gitlab.exceptions.GitlabAuthenticationError as e:
-            print(f"Ошибка аутентификации: {e}")
+{
+    "status_code": 200,
+    "headers": {"content-type": "application/json", ...},
+    "content": b'{"id": 1, "name": "project"}',
+    "text": '{"id": 1, "name": "project"}'
+}
 ```
 
-## Конфигурация
+### Обработка ошибок
 
-Асинхронный клиент поддерживает те же параметры конфигурации, что и синхронный:
+- **401 Unauthorized**: Вызывает `GitlabAuthenticationError`
+- **4xx/5xx ошибки**: Вызывают `GitlabHttpError`
+- **Сетевые ошибки**: Оборачиваются в `GitlabHttpError`
 
-```python
-async with gitlab.AsyncGitlab(
-    url="https://gitlab.com",
-    private_token="your-token",
-    timeout=30.0,
-    ssl_verify=True,
-    retry_transient_errors=True,
-    per_page=20,
-    user_agent="MyApp/1.0"
-) as gl:
-    # Ваш код здесь
-    pass
-```
+## Преимущества
 
-## Зависимости
-
-- `httpx>=0.28.1` - для асинхронных HTTP запросов
-- `requests-toolbelt` - для работы с multipart данными
-
-## Примеры
-
-Смотрите файл `examples/async_example.py` для полных примеров использования.
+1. **Простота**: Не нужно управлять жизненным циклом соединения
+2. **Надежность**: Каждый запрос изолирован
+3. **Производительность**: HTTPX обеспечивает высокую производительность
+4. **Совместимость**: Работает с существующим кодом python-gitlab
 
 ## Ограничения
 
-1. GraphQL клиент уже поддерживает асинхронность через `gitlab.AsyncGraphQL`
-2. Некоторые продвинутые функции могут требовать дополнительной адаптации
-3. Тестирование асинхронного кода требует специальных подходов
+- Только API версии 4
+- Базовые HTTP методы (GET, POST, PUT, DELETE, PATCH)
+- Нет встроенной поддержки пагинации
+- Нет поддержки GraphQL
 
-## Миграция с синхронной версии
+## Примеры
 
-Для миграции с синхронной версии:
-
-1. Замените `gitlab.Gitlab` на `gitlab.AsyncGitlab`
-2. Оберните код в `async def` функцию
-3. Добавьте `await` перед всеми вызовами методов клиента
-4. Используйте `async with` для контекстного менеджера
-5. Запускайте с `asyncio.run()`
-
-```python
-# Было
-gl = gitlab.Gitlab(url="https://gitlab.com", private_token="token")
-projects = gl.projects.list()
-
-# Стало
-async with gitlab.AsyncGitlab(url="https://gitlab.com", private_token="token") as gl:
-    projects = await gl.projects.list()
-``` 
+Смотрите файл `examples/async_example.py` для полных примеров использования. 
