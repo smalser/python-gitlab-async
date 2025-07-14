@@ -26,3 +26,24 @@ class Backend(Protocol):
         stream: bool | None,
         **kwargs: Any,
     ) -> BackendResponse: ...
+
+
+class AsyncBackendResponse(Protocol):
+    @abc.abstractmethod
+    def __init__(self, response: Any) -> None: ...
+
+
+class AsyncBackend(Protocol):
+    @abc.abstractmethod
+    async def http_request(
+        self,
+        method: str,
+        url: str,
+        json: dict[str, Any] | bytes | None,
+        data: dict[str, Any] | MultipartEncoder | None,
+        params: Any | None,
+        timeout: float | None,
+        verify: bool | str | None,
+        stream: bool | None,
+        **kwargs: Any,
+    ) -> AsyncBackendResponse: ...

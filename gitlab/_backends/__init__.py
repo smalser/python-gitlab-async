@@ -10,6 +10,15 @@ from .requests_backend import (
     RequestsResponse,
 )
 
+try:
+    from .httpx_backend import (
+        HttpxBackend,
+        HttpxResponse,
+    )
+    _ASYNC_AVAILABLE = True
+except ImportError:
+    _ASYNC_AVAILABLE = False
+
 DefaultBackend = RequestsBackend
 DefaultResponse = RequestsResponse
 
@@ -20,3 +29,9 @@ __all__ = [
     "OAuthTokenAuth",
     "PrivateTokenAuth",
 ]
+
+if _ASYNC_AVAILABLE:
+    __all__.extend([
+        "HttpxBackend",
+        "HttpxResponse",
+    ])

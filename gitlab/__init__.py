@@ -29,6 +29,12 @@ from gitlab._version import (  # noqa: F401
 from gitlab.client import AsyncGraphQL, Gitlab, GitlabList, GraphQL  # noqa: F401
 from gitlab.exceptions import *  # noqa: F401,F403
 
+try:
+    from gitlab.async_client import AsyncGitlab  # noqa: F401
+    _ASYNC_AVAILABLE = True
+except ImportError:
+    _ASYNC_AVAILABLE = False
+
 warnings.filterwarnings("default", category=DeprecationWarning, module="^gitlab")
 
 
@@ -44,4 +50,8 @@ __all__ = [
     "AsyncGraphQL",
     "GraphQL",
 ]
+
+if _ASYNC_AVAILABLE:
+    __all__.append("AsyncGitlab")
+
 __all__.extend(gitlab.exceptions.__all__)

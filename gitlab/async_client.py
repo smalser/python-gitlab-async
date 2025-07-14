@@ -1,4 +1,4 @@
-"""Wrapper for the GitLab API."""
+"""Async wrapper for the GitLab API."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import re
 from typing import Any, BinaryIO, cast, TYPE_CHECKING
 from urllib import parse
 
-import requests
+import httpx
 
 import gitlab
 import gitlab.config
@@ -19,9 +19,8 @@ try:
     import gql
     import gql.transport.exceptions
     import graphql
-    import httpx
 
-    from ._backends.graphql import GitlabAsyncTransport, GitlabTransport
+    from ._backends.graphql import GitlabAsyncTransport
 
     _GQL_INSTALLED = True
 except ImportError:  # pragma: no cover
@@ -42,8 +41,8 @@ _PAGINATION_URL = (
 )
 
 
-class Gitlab:
-    """Represents a GitLab server connection.
+class AsyncGitlab:
+    """Represents an async GitLab server connection.
 
     Args:
         url: The URL of the GitLab server (defaults to https://gitlab.com).
@@ -66,8 +65,8 @@ class Gitlab:
             differs from response headers
 
     Keyword Args:
-        requests.Session session: HTTP Requests Session
-        RequestsBackend backend: Backend that will be used to make http requests
+        httpx.AsyncClient client: HTTP AsyncClient
+        HttpxBackend backend: Backend that will be used to make http requests
     """
 
     def __init__(
@@ -112,8 +111,8 @@ class Gitlab:
         self._set_auth_info()
 
         #: Create a session object for requests
-        _backend: type[_backends.DefaultBackend] = kwargs.pop(
-            "backend", _backends.DefaultBackend
+        _backend: type[_backends.HttpxBackend] = kwargs.pop(
+            "backend", _backends.HttpxBackend
         )
         self._backend = _backend(**kwargs)
         self.session = self._backend.client
@@ -215,11 +214,11 @@ class Gitlab:
         self.statistics = objects.ApplicationStatisticsManager(self)
         """See :class:`~gitlab.v4.objects.ApplicationStatisticsManager`"""
 
-    def __enter__(self) -> Gitlab:
+    async def __aenter__(self) -> AsyncGitlab:
         return self
 
-    def __exit__(self, *args: Any) -> None:
-        self.session.close()
+    async def __aexit__(self, *args: Any) -> None:
+        await self.session.aclose()
 
     def __getstate__(self) -> dict[str, Any]:
         state = self.__dict__.copy()
@@ -260,7 +259,7 @@ class Gitlab:
         gitlab_id: str | None = None,
         config_files: list[str] | None = None,
         **kwargs: Any,
-    ) -> Gitlab:
+    ) -> AsyncGitlab:
         """Create a Gitlab connection from configuration files.
 
         Args:
@@ -268,7 +267,7 @@ class Gitlab:
             config_files list[str]: List of paths to configuration files.
 
         kwargs:
-            session requests.Session: Custom requests Session
+            client httpx.AsyncClient: Custom httpx AsyncClient
 
         Returns:
             A Gitlab connection.
@@ -304,7 +303,7 @@ class Gitlab:
         options: dict[str, Any],
         gitlab_id: str | None = None,
         config_files: list[str] | None = None,
-    ) -> Gitlab:
+    ) -> AsyncGitlab:
         """Create a Gitlab connection by merging configuration with
         the following precedence:
 
@@ -323,7 +322,7 @@ class Gitlab:
             gitlab_id: ID of the configuration section.
             config_files: List of paths to configuration files.
         Returns:
-            (gitlab.Gitlab): A Gitlab connection.
+            (gitlab.AsyncGitlab): A Gitlab connection.
 
         Raises:
             gitlab.config.GitlabDataError: If the configuration is not correct.
@@ -381,19 +380,19 @@ class Gitlab:
 
         return (None, None, None)
 
-    def auth(self) -> None:
+    async def auth(self) -> None:
         """Performs an authentication using private token. Warns the user if a
         potentially misconfigured URL is detected on the client or server side.
 
         The `user` attribute will hold a `gitlab.objects.CurrentUser` object on
         success.
         """
-        self.user = self._objects.CurrentUserManager(self).get()
+        self.user = await self._objects.CurrentUserManager(self).get()
 
         if hasattr(self.user, "web_url") and hasattr(self.user, "username"):
             self._check_url(self.user.web_url, path=self.user.username)
 
-    def version(self) -> tuple[str, str]:
+    async def version(self) -> tuple[str, str]:
         """Returns the version and revision of the gitlab server.
 
         Note that self.version and self.revision will be set on the gitlab
@@ -405,7 +404,7 @@ class Gitlab:
         """
         if self._server_version is None:
             try:
-                data = self.http_get("/version")
+                data = await self.http_get("/version")
                 if isinstance(data, dict):
                     self._server_version = data["version"]
                     self._server_revision = data["revision"]
@@ -419,7 +418,7 @@ class Gitlab:
         return cast(str, self._server_version), cast(str, self._server_revision)
 
     @gitlab.exceptions.on_http_error(gitlab.exceptions.GitlabMarkdownError)
-    def markdown(
+    async def markdown(
         self, text: str, gfm: bool = False, project: str | None = None, **kwargs: Any
     ) -> str:
         """Render an arbitrary Markdown document.
@@ -440,14 +439,14 @@ class Gitlab:
         post_data = {"text": text, "gfm": gfm}
         if project is not None:
             post_data["project"] = project
-        data = self.http_post("/markdown", post_data=post_data, **kwargs)
+        data = await self.http_post("/markdown", post_data=post_data, **kwargs)
         if TYPE_CHECKING:
-            assert not isinstance(data, requests.Response)
+            assert not isinstance(data, httpx.Response)
             assert isinstance(data["html"], str)
         return data["html"]
 
     @gitlab.exceptions.on_http_error(gitlab.exceptions.GitlabLicenseError)
-    def get_license(self, **kwargs: Any) -> dict[str, str | dict[str, str]]:
+    async def get_license(self, **kwargs: Any) -> dict[str, str | dict[str, str]]:
         """Retrieve information about the current license.
 
         Args:
@@ -460,13 +459,13 @@ class Gitlab:
         Returns:
             The current license information
         """
-        result = self.http_get("/license", **kwargs)
+        result = await self.http_get("/license", **kwargs)
         if isinstance(result, dict):
             return result
         return {}
 
     @gitlab.exceptions.on_http_error(gitlab.exceptions.GitlabLicenseError)
-    def set_license(self, license: str, **kwargs: Any) -> dict[str, Any]:
+    async def set_license(self, license: str, **kwargs: Any) -> dict[str, Any]:
         """Add a new license.
 
         Args:
@@ -481,9 +480,9 @@ class Gitlab:
             The new license information
         """
         data = {"license": license}
-        result = self.http_post("/license", post_data=data, **kwargs)
+        result = await self.http_post("/license", post_data=data, **kwargs)
         if TYPE_CHECKING:
-            assert not isinstance(result, requests.Response)
+            assert not isinstance(result, httpx.Response)
         return result
 
     def _set_auth_info(self) -> None:
@@ -507,7 +506,7 @@ class Gitlab:
                 "authentication should be defined"
             )
 
-        self._auth: requests.auth.AuthBase | None = None
+        self._auth: httpx.Auth | None = None
         if self.private_token:
             self._auth = _backends.PrivateTokenAuth(self.private_token)
 
@@ -518,9 +517,7 @@ class Gitlab:
             self._auth = _backends.JobTokenAuth(self.job_token)
 
         if self.http_username and self.http_password:
-            self._auth = requests.auth.HTTPBasicAuth(
-                self.http_username, self.http_password
-            )
+            self._auth = httpx.BasicAuth(self.http_username, self.http_password)
 
     def enable_debug(self, mask_credentials: bool = True) -> None:
         import logging
@@ -535,9 +532,9 @@ class Gitlab:
         httpclient_log.propagate = True
         httpclient_log.setLevel(logging.DEBUG)
 
-        requests_log = logging.getLogger("requests.packages.urllib3")
-        requests_log.setLevel(logging.DEBUG)
-        requests_log.propagate = True
+        httpx_log = logging.getLogger("httpx")
+        httpx_log.setLevel(logging.DEBUG)
+        httpx_log.propagate = True
 
         # shadow http.client prints to log()
         # https://stackoverflow.com/a/16337639
@@ -607,7 +604,7 @@ class Gitlab:
         return url
 
     @staticmethod
-    def _check_redirects(result: requests.Response) -> None:
+    def _check_redirects(result: httpx.Response) -> None:
         # Check the requests history to detect 301/302 redirections.
         # If the initial verb is POST or PUT, the redirected request will use a
         # GET request, leading to unwanted behaviour.
@@ -626,13 +623,13 @@ class Gitlab:
             raise gitlab.exceptions.RedirectError(
                 REDIRECT_MSG.format(
                     status_code=item.status_code,
-                    reason=item.reason,
+                    reason=item.reason_phrase,
                     source=item.url,
                     target=target,
                 )
             )
 
-    def http_request(
+    async def http_request(
         self,
         verb: str,
         path: str,
@@ -647,7 +644,7 @@ class Gitlab:
         max_retries: int = 10,
         extra_headers: dict[str, Any] | None = None,
         **kwargs: Any,
-    ) -> requests.Response:
+    ) -> httpx.Response:
         """Make an HTTP request to the Gitlab server.
 
         Args:
@@ -671,7 +668,7 @@ class Gitlab:
             **kwargs: Extra options to send to the server (e.g. sudo)
 
         Returns:
-            A requests result object.
+            A httpx result object.
 
         Raises:
             GitlabHttpError: When the return code is not 2xx
@@ -725,7 +722,7 @@ class Gitlab:
 
         while True:
             try:
-                result = self._backend.http_request(
+                result = await self._backend.http_request(
                     method=verb,
                     url=url,
                     json=send_data.json,
@@ -736,7 +733,7 @@ class Gitlab:
                     stream=streamed,
                     **opts,
                 )
-            except (requests.ConnectionError, requests.exceptions.ChunkedEncodingError):
+            except (httpx.ConnectError, httpx.ReadError):
                 if retry.handle_retry():
                     continue
                 raise
@@ -773,14 +770,14 @@ class Gitlab:
                 response_body=result.content,
             )
 
-    def http_get(
+    async def http_get(
         self,
         path: str,
         query_data: dict[str, Any] | None = None,
         streamed: bool = False,
         raw: bool = False,
         **kwargs: Any,
-    ) -> dict[str, Any] | requests.Response:
+    ) -> dict[str, Any] | httpx.Response:
         """Make a GET request to the Gitlab server.
 
         Args:
@@ -792,7 +789,7 @@ class Gitlab:
             **kwargs: Extra options to send to the server (e.g. sudo)
 
         Returns:
-            A requests result object is streamed is True or the content type is
+            A httpx result object is streamed is True or the content type is
             not json.
             The parsed json data otherwise.
 
@@ -801,7 +798,7 @@ class Gitlab:
             GitlabParsingError: If the json data could not be parsed
         """
         query_data = query_data or {}
-        result = self.http_request(
+        result = await self.http_request(
             "get", path, query_data=query_data, streamed=streamed, **kwargs
         )
         content_type = utils.get_content_type(result.headers.get("Content-Type"))
@@ -819,9 +816,9 @@ class Gitlab:
         else:
             return result
 
-    def http_head(
+    async def http_head(
         self, path: str, query_data: dict[str, Any] | None = None, **kwargs: Any
-    ) -> requests.structures.CaseInsensitiveDict[Any]:
+    ) -> httpx.Headers:
         """Make a HEAD request to the Gitlab server.
 
         Args:
@@ -831,16 +828,16 @@ class Gitlab:
             **kwargs: Extra options to send to the server (e.g. sudo, page,
                       per_page)
         Returns:
-            A requests.header object
+            A httpx.headers object
         Raises:
             GitlabHttpError: When the return code is not 2xx
         """
 
         query_data = query_data or {}
-        result = self.http_request("head", path, query_data=query_data, **kwargs)
+        result = await self.http_request("head", path, query_data=query_data, **kwargs)
         return result.headers
 
-    def http_list(
+    async def http_list(
         self,
         path: str,
         query_data: dict[str, Any] | None = None,
@@ -848,7 +845,7 @@ class Gitlab:
         iterator: bool | None = None,
         message_details: utils.WarnMessageData | None = None,
         **kwargs: Any,
-    ) -> GitlabList | list[dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """Make a GET request to the Gitlab server for list-oriented queries.
 
         Args:
@@ -860,11 +857,7 @@ class Gitlab:
                       per_page)
 
         Returns:
-            A list of the objects returned by the server. If `iterator` is
-            True and no pagination-related arguments (`page`, `per_page`,
-            `get_all`) are defined then a GitlabList object (generator) is returned
-            instead. This object will make API calls when needed to fetch the
-            next items from the server.
+            A list of the objects returned by the server.
 
         Raises:
             GitlabHttpError: When the return code is not 2xx
@@ -883,74 +876,29 @@ class Gitlab:
 
         page = kwargs.get("page")
 
-        if iterator:
-            if page is not None:
-                utils.warn(
-                    message=(
-                        f"`iterator={iterator}` and `page={page}` were both specified. "
-                        f"`page={page}` will be ignored."
-                    ),
-                    category=UserWarning,
-                )
-
-            # Generator requested
-            return GitlabList(self, url, query_data, **kwargs)
-
         if get_all is True:
-            return list(GitlabList(self, url, query_data, **kwargs))
-
-        # pagination requested, we return a list
-        gl_list = GitlabList(self, url, query_data, get_next=False, **kwargs)
-        items = list(gl_list)
-
-        def should_emit_warning() -> bool:
-            # No warning is emitted if any of the following conditions apply:
-            # * `get_all=False` was set in the `list()` call.
-            # * `page` was set in the `list()` call.
-            # * GitLab did not return the `x-per-page` header.
-            # * Number of items received is less than per-page value.
-            # * Number of items received is >= total available.
-            if get_all is False:
-                return False
-            if page is not None:
-                return False
-            if gl_list.per_page is None:
-                return False
-            if len(items) < gl_list.per_page:
-                return False
-            if gl_list.total is not None and len(items) >= gl_list.total:
-                return False
-            return True
-
-        if not should_emit_warning():
+            # For async, we'll return all items in a list
+            items = []
+            current_page = 1
+            while True:
+                kwargs["page"] = current_page
+                result = await self.http_get(path, query_data=query_data, **kwargs)
+                if isinstance(result, dict) and isinstance(result.get("data"), list):
+                    items.extend(result["data"])
+                    if len(result["data"]) < kwargs.get("per_page", 20):
+                        break
+                    current_page += 1
+                else:
+                    break
             return items
 
-        # Warn the user that they are only going to retrieve `per_page`
-        # maximum items. This is a common cause of issues filed.
-        total_items = "many" if gl_list.total is None else gl_list.total
-        if message_details is not None:
-            message = message_details.message.format_map(
-                {
-                    "len_items": len(items),
-                    "per_page": gl_list.per_page,
-                    "total_items": total_items,
-                }
-            )
-            show_caller = message_details.show_caller
-        else:
-            message = (
-                f"Calling a `list()` method without specifying `get_all=True` or "
-                f"`iterator=True` will return a maximum of {gl_list.per_page} items. "
-                f"Your query returned {len(items)} of {total_items} items. See "
-                f"{_PAGINATION_URL} for more details. If this was done intentionally, "
-                f"then this warning can be supressed by adding the argument "
-                f"`get_all=False` to the `list()` call."
-            )
-            show_caller = True
-        utils.warn(message=message, category=UserWarning, show_caller=show_caller)
-        return items
+        # pagination requested, we return a list
+        result = await self.http_get(path, query_data=query_data, **kwargs)
+        if isinstance(result, dict) and isinstance(result.get("data"), list):
+            return result["data"]
+        return []
 
-    def http_post(
+    async def http_post(
         self,
         path: str,
         query_data: dict[str, Any] | None = None,
@@ -958,7 +906,7 @@ class Gitlab:
         raw: bool = False,
         files: dict[str, Any] | None = None,
         **kwargs: Any,
-    ) -> dict[str, Any] | requests.Response:
+    ) -> dict[str, Any] | httpx.Response:
         """Make a POST request to the Gitlab server.
 
         Args:
@@ -982,7 +930,7 @@ class Gitlab:
         query_data = query_data or {}
         post_data = post_data or {}
 
-        result = self.http_request(
+        result = await self.http_request(
             "post",
             path,
             query_data=query_data,
@@ -1005,7 +953,7 @@ class Gitlab:
             ) from e
         return result
 
-    def http_put(
+    async def http_put(
         self,
         path: str,
         query_data: dict[str, Any] | None = None,
@@ -1013,7 +961,7 @@ class Gitlab:
         raw: bool = False,
         files: dict[str, Any] | None = None,
         **kwargs: Any,
-    ) -> dict[str, Any] | requests.Response:
+    ) -> dict[str, Any] | httpx.Response:
         """Make a PUT request to the Gitlab server.
 
         Args:
@@ -1036,7 +984,7 @@ class Gitlab:
         query_data = query_data or {}
         post_data = post_data or {}
 
-        result = self.http_request(
+        result = await self.http_request(
             "put",
             path,
             query_data=query_data,
@@ -1057,7 +1005,7 @@ class Gitlab:
                 error_message="Failed to parse the server message"
             ) from e
 
-    def http_patch(
+    async def http_patch(
         self,
         path: str,
         *,
@@ -1065,7 +1013,7 @@ class Gitlab:
         post_data: dict[str, Any] | bytes | None = None,
         raw: bool = False,
         **kwargs: Any,
-    ) -> dict[str, Any] | requests.Response:
+    ) -> dict[str, Any] | httpx.Response:
         """Make a PATCH request to the Gitlab server.
 
         Args:
@@ -1087,7 +1035,7 @@ class Gitlab:
         query_data = query_data or {}
         post_data = post_data or {}
 
-        result = self.http_request(
+        result = await self.http_request(
             "patch", path, query_data=query_data, post_data=post_data, raw=raw, **kwargs
         )
         if result.status_code in gitlab.const.NO_JSON_RESPONSE_CODES:
@@ -1102,7 +1050,7 @@ class Gitlab:
                 error_message="Failed to parse the server message"
             ) from e
 
-    def http_delete(self, path: str, **kwargs: Any) -> requests.Response:
+    async def http_delete(self, path: str, **kwargs: Any) -> httpx.Response:
         """Make a DELETE request to the Gitlab server.
 
         Args:
@@ -1111,17 +1059,17 @@ class Gitlab:
             **kwargs: Extra options to send to the server (e.g. sudo)
 
         Returns:
-            The requests object.
+            The httpx object.
 
         Raises:
             GitlabHttpError: When the return code is not 2xx
         """
-        return self.http_request("delete", path, **kwargs)
+        return await self.http_request("delete", path, **kwargs)
 
     @gitlab.exceptions.on_http_error(gitlab.exceptions.GitlabSearchError)
-    def search(
+    async def search(
         self, scope: str, search: str, **kwargs: Any
-    ) -> GitlabList | list[dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """Search GitLab resources matching the provided string.'
 
         Args:
@@ -1137,317 +1085,4 @@ class Gitlab:
             A list of dicts describing the resources found.
         """
         data = {"scope": scope, "search": search}
-        return self.http_list("/search", query_data=data, **kwargs)
-
-
-class GitlabList:
-    """Generator representing a list of remote objects.
-
-    The object handles the links returned by a query to the API, and will call
-    the API again when needed.
-    """
-
-    def __init__(
-        self,
-        gl: Gitlab,
-        url: str,
-        query_data: dict[str, Any],
-        get_next: bool = True,
-        **kwargs: Any,
-    ) -> None:
-        self._gl = gl
-
-        # Preserve kwargs for subsequent queries
-        self._kwargs = kwargs.copy()
-
-        self._query(url, query_data, **self._kwargs)
-        self._get_next = get_next
-
-        # Remove query_parameters from kwargs, which are saved via the `next` URL
-        self._kwargs.pop("query_parameters", None)
-
-    def _query(
-        self, url: str, query_data: dict[str, Any] | None = None, **kwargs: Any
-    ) -> None:
-        query_data = query_data or {}
-        result = self._gl.http_request("get", url, query_data=query_data, **kwargs)
-        try:
-            next_url = result.links["next"]["url"]
-        except KeyError:
-            next_url = None
-
-        self._next_url = self._gl._check_url(next_url)
-        self._current_page: str | None = result.headers.get("X-Page")
-        self._prev_page: str | None = result.headers.get("X-Prev-Page")
-        self._next_page: str | None = result.headers.get("X-Next-Page")
-        self._per_page: str | None = result.headers.get("X-Per-Page")
-        self._total_pages: str | None = result.headers.get("X-Total-Pages")
-        self._total: str | None = result.headers.get("X-Total")
-
-        try:
-            self._data: list[dict[str, Any]] = result.json()
-        except Exception as e:
-            raise gitlab.exceptions.GitlabParsingError(
-                error_message="Failed to parse the server message"
-            ) from e
-
-        self._current = 0
-
-    @property
-    def current_page(self) -> int:
-        """The current page number."""
-        if TYPE_CHECKING:
-            assert self._current_page is not None
-        return int(self._current_page)
-
-    @property
-    def prev_page(self) -> int | None:
-        """The previous page number.
-
-        If None, the current page is the first.
-        """
-        return int(self._prev_page) if self._prev_page else None
-
-    @property
-    def next_page(self) -> int | None:
-        """The next page number.
-
-        If None, the current page is the last.
-        """
-        return int(self._next_page) if self._next_page else None
-
-    @property
-    def per_page(self) -> int | None:
-        """The number of items per page."""
-        return int(self._per_page) if self._per_page is not None else None
-
-    # NOTE(jlvillal): When a query returns more than 10,000 items, GitLab doesn't return
-    # the headers 'x-total-pages' and 'x-total'. In those cases we return None.
-    # https://docs.gitlab.com/ee/user/gitlab_com/index.html#pagination-response-headers
-    @property
-    def total_pages(self) -> int | None:
-        """The total number of pages."""
-        if self._total_pages is not None:
-            return int(self._total_pages)
-        return None
-
-    @property
-    def total(self) -> int | None:
-        """The total number of items."""
-        if self._total is not None:
-            return int(self._total)
-        return None
-
-    def __iter__(self) -> GitlabList:
-        return self
-
-    def __len__(self) -> int:
-        if self._total is None:
-            return 0
-        return int(self._total)
-
-    def __next__(self) -> dict[str, Any]:
-        return self.next()
-
-    def next(self) -> dict[str, Any]:
-        try:
-            item = self._data[self._current]
-            self._current += 1
-            return item
-        except IndexError:
-            pass
-
-        if self._next_url and self._get_next is True:
-            self._query(self._next_url, **self._kwargs)
-            return self.next()
-
-        raise StopIteration
-
-
-class _BaseGraphQL:
-    def __init__(
-        self,
-        url: str | None = None,
-        *,
-        token: str | None = None,
-        ssl_verify: bool | str = True,
-        timeout: float | None = None,
-        user_agent: str = gitlab.const.USER_AGENT,
-        fetch_schema_from_transport: bool = False,
-        max_retries: int = 10,
-        obey_rate_limit: bool = True,
-        retry_transient_errors: bool = False,
-    ) -> None:
-        if not _GQL_INSTALLED:
-            raise ImportError(
-                "The GraphQL client could not be initialized because "
-                "the gql dependencies are not installed. "
-                "Install them with 'pip install python-gitlab[graphql]'"
-            )
-        self._base_url = utils.get_base_url(url)
-        self._timeout = timeout
-        self._token = token
-        self._url = f"{self._base_url}/api/graphql"
-        self._user_agent = user_agent
-        self._ssl_verify = ssl_verify
-        self._max_retries = max_retries
-        self._obey_rate_limit = obey_rate_limit
-        self._retry_transient_errors = retry_transient_errors
-        self._client_opts = self._get_client_opts()
-        self._fetch_schema_from_transport = fetch_schema_from_transport
-
-    def _get_client_opts(self) -> dict[str, Any]:
-        headers = {"User-Agent": self._user_agent}
-
-        if self._token:
-            headers["Authorization"] = f"Bearer {self._token}"
-
-        return {
-            "headers": headers,
-            "timeout": self._timeout,
-            "verify": self._ssl_verify,
-        }
-
-
-class GraphQL(_BaseGraphQL):
-    def __init__(
-        self,
-        url: str | None = None,
-        *,
-        token: str | None = None,
-        ssl_verify: bool | str = True,
-        client: httpx.Client | None = None,
-        timeout: float | None = None,
-        user_agent: str = gitlab.const.USER_AGENT,
-        fetch_schema_from_transport: bool = False,
-        max_retries: int = 10,
-        obey_rate_limit: bool = True,
-        retry_transient_errors: bool = False,
-    ) -> None:
-        super().__init__(
-            url=url,
-            token=token,
-            ssl_verify=ssl_verify,
-            timeout=timeout,
-            user_agent=user_agent,
-            fetch_schema_from_transport=fetch_schema_from_transport,
-            max_retries=max_retries,
-            obey_rate_limit=obey_rate_limit,
-            retry_transient_errors=retry_transient_errors,
-        )
-
-        self._http_client = client or httpx.Client(**self._client_opts)
-        self._transport = GitlabTransport(self._url, client=self._http_client)
-        self._client = gql.Client(
-            transport=self._transport,
-            fetch_schema_from_transport=fetch_schema_from_transport,
-        )
-        self._gql = gql.gql
-
-    def __enter__(self) -> GraphQL:
-        return self
-
-    def __exit__(self, *args: Any) -> None:
-        self._http_client.close()
-
-    def execute(self, request: str | graphql.Source, *args: Any, **kwargs: Any) -> Any:
-        parsed_document = self._gql(request)
-        retry = utils.Retry(
-            max_retries=self._max_retries,
-            obey_rate_limit=self._obey_rate_limit,
-            retry_transient_errors=self._retry_transient_errors,
-        )
-
-        while True:
-            try:
-                result = self._client.execute(parsed_document, *args, **kwargs)
-            except gql.transport.exceptions.TransportServerError as e:
-                if retry.handle_retry_on_status(
-                    status_code=e.code, headers=self._transport.response_headers
-                ):
-                    continue
-
-                if e.code == 401:
-                    raise gitlab.exceptions.GitlabAuthenticationError(
-                        response_code=e.code, error_message=str(e)
-                    )
-
-                raise gitlab.exceptions.GitlabHttpError(
-                    response_code=e.code, error_message=str(e)
-                )
-
-            return result
-
-
-class AsyncGraphQL(_BaseGraphQL):
-    def __init__(
-        self,
-        url: str | None = None,
-        *,
-        token: str | None = None,
-        ssl_verify: bool | str = True,
-        client: httpx.AsyncClient | None = None,
-        timeout: float | None = None,
-        user_agent: str = gitlab.const.USER_AGENT,
-        fetch_schema_from_transport: bool = False,
-        max_retries: int = 10,
-        obey_rate_limit: bool = True,
-        retry_transient_errors: bool = False,
-    ) -> None:
-        super().__init__(
-            url=url,
-            token=token,
-            ssl_verify=ssl_verify,
-            timeout=timeout,
-            user_agent=user_agent,
-            fetch_schema_from_transport=fetch_schema_from_transport,
-            max_retries=max_retries,
-            obey_rate_limit=obey_rate_limit,
-            retry_transient_errors=retry_transient_errors,
-        )
-
-        self._http_client = client or httpx.AsyncClient(**self._client_opts)
-        self._transport = GitlabAsyncTransport(self._url, client=self._http_client)
-        self._client = gql.Client(
-            transport=self._transport,
-            fetch_schema_from_transport=fetch_schema_from_transport,
-        )
-        self._gql = gql.gql
-
-    async def __aenter__(self) -> AsyncGraphQL:
-        return self
-
-    async def __aexit__(self, *args: Any) -> None:
-        await self._http_client.aclose()
-
-    async def execute(
-        self, request: str | graphql.Source, *args: Any, **kwargs: Any
-    ) -> Any:
-        parsed_document = self._gql(request)
-        retry = utils.Retry(
-            max_retries=self._max_retries,
-            obey_rate_limit=self._obey_rate_limit,
-            retry_transient_errors=self._retry_transient_errors,
-        )
-
-        while True:
-            try:
-                result = await self._client.execute_async(
-                    parsed_document, *args, **kwargs
-                )
-            except gql.transport.exceptions.TransportServerError as e:
-                if retry.handle_retry_on_status(
-                    status_code=e.code, headers=self._transport.response_headers
-                ):
-                    continue
-
-                if e.code == 401:
-                    raise gitlab.exceptions.GitlabAuthenticationError(
-                        response_code=e.code, error_message=str(e)
-                    )
-
-                raise gitlab.exceptions.GitlabHttpError(
-                    response_code=e.code, error_message=str(e)
-                )
-
-            return result
+        return await self.http_list("/search", query_data=data, **kwargs) 
