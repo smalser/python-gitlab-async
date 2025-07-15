@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Any, BinaryIO, cast, TYPE_CHECKING
+from typing import Any, BinaryIO, cast, TYPE_CHECKING, Union
 from urllib import parse
 
 import requests
@@ -647,7 +647,7 @@ class Gitlab:
         max_retries: int = 10,
         extra_headers: dict[str, Any] | None = None,
         **kwargs: Any,
-    ) -> requests.Response:
+    ) -> Union[requests.Response, httpx.Response]:
         """Make an HTTP request to the Gitlab server.
 
         Args:

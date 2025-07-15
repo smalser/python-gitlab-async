@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import Any, BinaryIO, TYPE_CHECKING
+from typing import Any, BinaryIO, TYPE_CHECKING, Dict
 
 import requests
 from requests import PreparedRequest
